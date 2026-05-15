@@ -25,25 +25,39 @@ public class RestaurantScrapingClient {
 
     private static final Logger log = LoggerFactory.getLogger(RestaurantScrapingClient.class);
 
-    // ── Overpass: GET con ?data=<query_urlencoded> ─────────────────────────
+    // ── Overpass ───────────────────────────────────────────────────────────
     private static final String OVERPASS_URL        = "https://overpass-api.de/api/interpreter";
     private static final String OVERPASS_URL_MIRROR = "https://lz4.overpass-api.de/api/interpreter";
 
-    // ── Nominatim fallback ──────────────────────────────────────────────────
+    // ── Nominatim fallback ─────────────────────────────────────────────────
     private static final String NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
 
-    // ── Foursquare nueva Places API (dominio y versión actualizados) ────────
+    // ── Foursquare ─────────────────────────────────────────────────────────
     private static final String FSQ_BASE          = "https://places-api.foursquare.com";
     private static final String FSQ_SEARCH        = FSQ_BASE + "/places/search";
     private static final String FSQ_DETAILS       = FSQ_BASE + "/places/";
     private static final String FSQ_API_VERSION   = "2025-06-17";
-    private static final String FSQ_FOOD_CATEGORY = "13000";     // Food & Dining
+    private static final String FSQ_FOOD_CATEGORY = "13000";
 
-    // ── Cache para evitar rate limits ───────────────────────────────────────
+    // ── Google Places API (New) ────────────────────────────────────────────
+    private static final String GOOGLE_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby";
+    private static final String GOOGLE_FIELDS     =
+            "places.displayName,places.formattedAddress,places.rating," +
+            "places.priceLevel,places.internationalPhoneNumber,places.websiteUri," +
+            "places.regularOpeningHours,places.editorialSummary,places.types," +
+            "places.location,places.id";
+
+    // ── Umbral de distancia para match por coordenadas ─────────────────────
+    // scrapeNearby usa 80m (varios restaurantes en zona → más estricto)
+    // scrapeRestaurantInfo usa 250m (búsqueda puntual → más flexible)
+    private static final double NEARBY_THRESHOLD_M  = 80.0;
+    private static final double SINGLE_THRESHOLD_M  = 250.0;
+
+    // ── Cache Foursquare ───────────────────────────────────────────────────
     private final Map<String, FoursquarePlace> fsqCache = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${application.scraping.user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36}")
+    @Value("${application.scraping.user-agent:foodik-app/1.0 (universidad proyecto)}")
     private String userAgent;
 
     @Value("${application.scraping.timeout-ms:15000}")
@@ -52,21 +66,25 @@ public class RestaurantScrapingClient {
     @Value("${application.scraping.foursquare-api-key:}")
     private String foursquareApiKey;
 
+    @Value("${application.scraping.google-api-key:}")
+    private String googleApiKey;
+
     // =========================================================================
     // PUBLIC API
     // =========================================================================
 
     /**
      * Busca restaurantes cercanos con estrategia multi-fuente.
-     * El cliente nunca lanza excepción — siempre devuelve lista (vacía en peor caso).
+     * 1. Overpass  → fuente principal OSM
+     * 2. Nominatim → fallback si Overpass da pocos resultados
+     * 3. Google    → enriquecimiento prioritario (rating, precio, horarios, teléfono)
+     * 4. Foursquare→ enriquecimiento secundario si no hay Google
      */
     public List<RestaurantScrapedInfoResponse> scrapeNearby(double lat, double lng, int radiusM) {
         log.info("scrapeNearby: lat={}, lng={}, radius={}m", lat, lng, radiusM);
 
-        // 1. Overpass vía GET
         List<RestaurantScrapedInfoResponse> results = queryOverpass(lat, lng, radiusM);
 
-        // 2. Nominatim si Overpass devolvió muy poco
         if (results.size() < 3) {
             log.warn("Overpass devolvió {} resultados — complementando con Nominatim", results.size());
             Set<String> seen = new HashSet<>();
@@ -76,8 +94,13 @@ public class RestaurantScrapingClient {
             }
         }
 
-        // 3. Enriquecimiento Foursquare (opcional)
-        if (hasFoursquareKey() && !results.isEmpty()) {
+        if (hasGoogleKey() && !results.isEmpty()) {
+            log.info("Enriqueciendo con Google Places API...");
+            results = enrichWithGoogle(results, lat, lng, radiusM, NEARBY_THRESHOLD_M);
+        }
+
+        if (!hasGoogleKey() && hasFoursquareKey() && !results.isEmpty()) {
+            log.info("Enriqueciendo con Foursquare Places API...");
             results = enrichWithFoursquare(results, lat, lng, radiusM);
         }
 
@@ -87,35 +110,62 @@ public class RestaurantScrapingClient {
 
     /**
      * Obtiene información de un restaurante específico por nombre y ciudad.
+     * 1. Overpass  → búsqueda por nombre en la ciudad
+     * 2. Nominatim → fallback si Overpass falla
+     * 3. Google    → enriquecimiento con umbral ampliado (250m) para búsqueda puntual
      */
     public RestaurantScrapedInfoResponse scrapeRestaurantInfo(String name, String city) {
         log.info("scrapeRestaurantInfo: '{}' en '{}'", name, city);
+
+        RestaurantScrapedInfoResponse result = null;
+
+        // 1. Overpass
         try {
             String query = String.format("""
-                    [out:json][timeout:15];
-                    area["name"~"%s",i]->.a;
-                    (
-                      node["amenity"~"restaurant|fast_food|cafe"]["name"~"%s",i](area.a);
-                      way["amenity"~"restaurant|fast_food|cafe"]["name"~"%s",i](area.a);
-                    );
-                    out body;
-                    """, escape(city), escape(name), escape(name));
+                [out:json][timeout:15];
+                area["name"~"%s",i]->.a;
+                (
+                  node["amenity"~"restaurant|fast_food|cafe"]["name"~"%s",i](area.a);
+                  way["amenity"~"restaurant|fast_food|cafe"]["name"~"%s",i](area.a);
+                );
+                out body;
+                """, escape(city), escape(name), escape(name));
 
             List<RestaurantScrapedInfoResponse> r = executeOverpassGet(query, OVERPASS_URL);
-            if (!r.isEmpty()) return r.get(0);
+            if (!r.isEmpty()) result = r.get(0);
         } catch (Exception e) {
             log.warn("Overpass falló para '{}': {}", name, e.getMessage());
         }
-        return queryNominatimSingle(name, city);
+
+        // 2. Nominatim si Overpass no encontró nada
+        if (result == null) {
+            result = queryNominatimSingle(name, city);
+        }
+
+        // 3. Google con umbral más amplio para búsqueda puntual
+        if (hasGoogleKey() && result != null
+                && result.latitude() != null && result.longitude() != null) {
+            log.info("Enriqueciendo '{}' con Google Places...", name);
+            List<RestaurantScrapedInfoResponse> enriched = enrichWithGoogle(
+                    List.of(result),
+                    result.latitude(),
+                    result.longitude(),
+                    500,
+                    SINGLE_THRESHOLD_M   // 250m — más flexible para búsqueda individual
+            );
+            if (!enriched.isEmpty()) result = enriched.get(0);
+        }
+
+        return result;
     }
 
     // =========================================================================
-    // OVERPASS — GET con ?data=<query_urlencoded>
+    // OVERPASS
     // =========================================================================
 
-
     private List<RestaurantScrapedInfoResponse> queryOverpass(double lat, double lng, int radiusM) {
-        String query = String.format("""
+        // Locale.US para punto decimal en vez de coma (locale colombiano)
+        String query = String.format(Locale.US, """
                 [out:json][timeout:25];
                 (
                   node["amenity"~"^(restaurant|fast_food|cafe|bar|pub|food_court)$"](around:%d,%f,%f);
@@ -143,7 +193,6 @@ public class RestaurantScrapingClient {
         }
     }
 
-
     private List<RestaurantScrapedInfoResponse> executeOverpassGet(String query, String endpoint)
             throws Exception {
         String url = endpoint + "?data=" + URLEncoder.encode(query, StandardCharsets.UTF_8);
@@ -151,9 +200,8 @@ public class RestaurantScrapingClient {
 
         String body = httpGet(url, Map.of(
                 "User-Agent",      userAgent,
-                "Accept",          "*/*",
-                "Accept-Language", "es-CO,es;q=0.9",
-                "Connection",      "keep-alive"
+                "Accept",          "application/json",
+                "Accept-Language", "es-CO,es;q=0.9"
         ));
         return parseOverpassResponse(body);
     }
@@ -172,15 +220,12 @@ public class RestaurantScrapingClient {
             String name = nullIfEmpty(tags.path("name").asText(null));
             if (name == null || !seen.add(normalizeName(name))) continue;
 
-            Double elLat = el.has("lat") ? el.path("lat").asDouble() : null;
-            Double elLon = el.has("lon") ? el.path("lon").asDouble() : null;
-
-            String phone   = firstNonNull(
-                    nullIfEmpty(tags.path("phone").asText(null)),
-                    nullIfEmpty(tags.path("contact:phone").asText(null)));
-            String website = firstNonNull(
-                    nullIfEmpty(tags.path("website").asText(null)),
-                    nullIfEmpty(tags.path("contact:website").asText(null)));
+            Double elLat  = el.has("lat") ? el.path("lat").asDouble() : null;
+            Double elLon  = el.has("lon") ? el.path("lon").asDouble() : null;
+            String phone  = firstNonNull(nullIfEmpty(tags.path("phone").asText(null)),
+                                         nullIfEmpty(tags.path("contact:phone").asText(null)));
+            String website= firstNonNull(nullIfEmpty(tags.path("website").asText(null)),
+                                         nullIfEmpty(tags.path("contact:website").asText(null)));
             String priceRange = extractOsmPrice(tags);
             String[] bounds   = normalizeCOP(priceRange);
             String osmId      = el.path("id").asText(null);
@@ -189,9 +234,7 @@ public class RestaurantScrapingClient {
             results.add(new RestaurantScrapedInfoResponse(
                     name,
                     nullIfEmpty(tags.path("description").asText(null)),
-                    priceRange,
-                    bounds[0], bounds[1],
-                    null,
+                    priceRange, bounds[0], bounds[1], null,
                     cleanCuisine(tags.path("cuisine").asText(null)),
                     nullIfEmpty(tags.path("opening_hours").asText(null)),
                     phone, website,
@@ -220,7 +263,8 @@ public class RestaurantScrapingClient {
                         + "&format=json&addressdetails=1&extratags=1&namedetails=1"
                         + "&viewbox=" + viewbox + "&bounded=1&limit=10&countrycodes=co";
                 log.debug("Nominatim query: {}", url);
-                JsonNode arr = objectMapper.readTree(httpGet(url, Map.of("User-Agent", userAgent,
+                JsonNode arr = objectMapper.readTree(httpGet(url, Map.of(
+                        "User-Agent",      userAgent,
                         "Accept-Language", "es-CO,es;q=0.9")));
                 if (!arr.isArray()) continue;
                 log.debug("Nominatim amenity={} → {} resultados", amenity, arr.size());
@@ -238,19 +282,55 @@ public class RestaurantScrapingClient {
         return new ArrayList<>(deduped.values());
     }
 
+    /**
+     * Nominatim mejorado para búsqueda individual.
+     * Estrategia en cascada: nombre+ciudad → solo nombre → vacío.
+     * Prefiere resultados de clase amenity/tourism.
+     */
     private RestaurantScrapedInfoResponse queryNominatimSingle(String name, String city) {
-        try {
-            String q = URLEncoder.encode(name + " " + city, StandardCharsets.UTF_8);
-            JsonNode arr = objectMapper.readTree(httpGet(
-                    NOMINATIM_URL + "?q=" + q + "&format=json&extratags=1&limit=1&countrycodes=co",
-                    Map.of("User-Agent", userAgent)));
-            if (!arr.isArray() || arr.isEmpty()) return empty(name, city);
-            RestaurantScrapedInfoResponse r = parseNominatimNode(arr.get(0));
-            return r != null ? r : empty(name, city);
-        } catch (Exception e) {
-            log.warn("Nominatim single falló para '{}': {}", name, e.getMessage());
-            return empty(name, city);
+        String encodedQuery = URLEncoder.encode(name + " " + city, StandardCharsets.UTF_8);
+        String encodedName  = URLEncoder.encode(name, StandardCharsets.UTF_8);
+
+        String[] attempts = {
+                "?q=" + encodedQuery + "&format=json&extratags=1&limit=5&countrycodes=co",
+                "?q=" + encodedName  + "&format=json&extratags=1&limit=5&countrycodes=co"
+        };
+
+        for (String attempt : attempts) {
+            try {
+                String url = NOMINATIM_URL + attempt;
+                log.debug("Nominatim single attempt: {}", url);
+                JsonNode arr = objectMapper.readTree(
+                        httpGet(url, Map.of("User-Agent", userAgent,
+                                "Accept-Language", "es-CO,es;q=0.9")));
+                if (!arr.isArray() || arr.isEmpty()) continue;
+
+                // Preferir resultados de amenity / tourism
+                for (JsonNode node : arr) {
+                    String cls = node.path("class").asText("");
+                    if ("amenity".equals(cls) || "tourism".equals(cls)) {
+                        RestaurantScrapedInfoResponse r = parseNominatimNode(node);
+                        if (r != null) {
+                            log.info("Nominatim single encontró '{}' (class={}) con intento: {}",
+                                    r.name(), cls, attempt.split("&")[0]);
+                            return r;
+                        }
+                    }
+                }
+                // Último recurso: primer resultado sin filtro
+                RestaurantScrapedInfoResponse r = parseNominatimNode(arr.get(0));
+                if (r != null) {
+                    log.info("Nominatim single encontró '{}' (sin filtro amenity) con intento: {}",
+                            r.name(), attempt.split("&")[0]);
+                    return r;
+                }
+            } catch (Exception e) {
+                log.warn("Nominatim single falló en intento '{}': {}", attempt.split("&")[0], e.getMessage());
+            }
         }
+
+        log.warn("Nominatim no encontró '{}' en '{}' — devolviendo respuesta vacía", name, city);
+        return empty(name, city);
     }
 
     private RestaurantScrapedInfoResponse parseNominatimNode(JsonNode node) {
@@ -275,23 +355,207 @@ public class RestaurantScrapingClient {
     }
 
     // =========================================================================
-    // FOURSQUARE nueva Places API
-    //   Dominio : places-api.foursquare.com
-    //   Header  : X-Places-Api-Version: 2025-06-17
-    //   Auth    : Authorization: Bearer <KEY>
-    //   Docs    : https://docs.foursquare.com/developer/reference/place-search
+    // GOOGLE PLACES API (New)
+    //   Endpoint : https://places.googleapis.com/v1/places:searchNearby
+    //   Auth     : X-Goog-Api-Key: <KEY>
+    //   Docs     : https://developers.google.com/maps/documentation/places/web-service/nearby-search
+    //
+    // FIX PRINCIPAL: el parámetro thresholdMeters permite usar un umbral diferente
+    // para scrapeNearby (80m, muchos restaurantes) vs scrapeRestaurantInfo (250m,
+    // búsqueda puntual donde el match debe ser más flexible).
     // =========================================================================
 
-    /**
-     * FIX RATE LIMIT 429:
-     * - Implementa caché local para no repetir búsquedas
-     * - Si Foursquare falla, devuelve resultados sin enriquecer (no rompe el flujo)
-     * - Log detallado para diagnóstico
-     */
+    private List<RestaurantScrapedInfoResponse> enrichWithGoogle(
+            List<RestaurantScrapedInfoResponse> results,
+            double lat, double lng, int radiusM,
+            double thresholdMeters) {
+        try {
+            // Body con concatenación de strings — evita coma decimal por locale colombiano
+            String requestBody = "{"
+                    + "\"includedTypes\": [\"restaurant\", \"cafe\", \"fast_food_restaurant\", \"bar\"],"
+                    + "\"maxResultCount\": 20,"
+                    + "\"locationRestriction\": {"
+                    +   "\"circle\": {"
+                    +     "\"center\": { \"latitude\": " + lat + ", \"longitude\": " + lng + " },"
+                    +     "\"radius\": " + Math.min(radiusM, 50000)
+                    +   "}"
+                    + "}"
+                    + "}";
+
+            log.debug("Google Places Nearby Search: lat={}, lng={}, radius={}, threshold={}m",
+                    lat, lng, radiusM, thresholdMeters);
+
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofMillis(timeoutMs))
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .build();
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(GOOGLE_NEARBY_URL))
+                    .header("Content-Type",     "application/json")
+                    .header("X-Goog-Api-Key",   googleApiKey)
+                    .header("X-Goog-FieldMask", GOOGLE_FIELDS)
+                    .header("User-Agent",        userAgent)
+                    .timeout(Duration.ofMillis(timeoutMs + 5000L))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                    .build();
+
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            log.debug("Google Places → HTTP {}", resp.statusCode());
+
+            if (!handleGoogleStatus(resp.statusCode(), resp.body())) return results;
+
+            // Índice por nombre normalizado + lista completa para match por coordenadas
+            Map<String, JsonNode> googleIndex = new LinkedHashMap<>();
+            List<JsonNode> googleList = new ArrayList<>();
+            JsonNode places = objectMapper.readTree(resp.body()).path("places");
+            if (places.isArray()) {
+                for (JsonNode p : places) {
+                    String n = p.path("displayName").path("text").asText(null);
+                    if (n != null) googleIndex.put(normalizeName(n), p);
+                    googleList.add(p);
+                }
+            }
+            log.info("Google Places indexó {} lugares para enriquecimiento", googleIndex.size());
+
+            // Merge: match por nombre → luego por coordenadas con thresholdMeters
+            List<RestaurantScrapedInfoResponse> enriched = new ArrayList<>();
+            int matchCount = 0;
+
+            for (RestaurantScrapedInfoResponse r : results) {
+
+                // Intento 1: nombre normalizado exacto
+                JsonNode g = r.name() != null ? googleIndex.get(normalizeName(r.name())) : null;
+
+                // Intento 2: coordenadas dentro del umbral configurable
+                // FIX: se eliminó la validación de nombre en el match por coordenadas
+                // porque los nombres de OSM/Nominatim y Google difieren frecuentemente.
+                if (g == null && r.latitude() != null && r.longitude() != null) {
+                    JsonNode closest = null;
+                    double minDist   = Double.MAX_VALUE;
+                    for (JsonNode candidate : googleList) {
+                        double gLat = candidate.path("location").path("latitude").asDouble(Double.NaN);
+                        double gLng = candidate.path("location").path("longitude").asDouble(Double.NaN);
+                        if (Double.isNaN(gLat) || Double.isNaN(gLng)) continue;
+                        double dist = haversineMeters(r.latitude(), r.longitude(), gLat, gLng);
+                        if (dist < minDist) { minDist = dist; closest = candidate; }
+                    }
+                    if (closest != null && minDist <= thresholdMeters) {
+                        g = closest;
+                        log.debug("Google match por coordenadas: '{}' ↔ '{}' ({:.1f}m)",
+                                r.name(),
+                                g.path("displayName").path("text").asText("?"),
+                                minDist);
+                    }
+                }
+
+                if (g == null) { enriched.add(r); continue; }
+                matchCount++;
+
+                // Extraer campos de Google, usar datos OSM como fallback
+                String priceSymbol = googlePriceToSymbol(g.path("priceLevel").asText(null));
+                String[] bounds    = normalizeCOP(priceSymbol);
+                String rating      = g.path("rating").isMissingNode() ? r.rating()
+                        : String.format(Locale.US, "%.1f / 5.0", g.path("rating").asDouble());
+                String phone       = firstNonNull(nullIfEmpty(g.path("internationalPhoneNumber").asText(null)), r.phone());
+                String website     = firstNonNull(nullIfEmpty(g.path("websiteUri").asText(null)), r.website());
+                String address     = firstNonNull(nullIfEmpty(g.path("formattedAddress").asText(null)), r.address());
+                String description = firstNonNull(nullIfEmpty(g.path("editorialSummary").path("text").asText(null)), r.description());
+                String hours       = firstNonNull(extractGoogleHours(g.path("regularOpeningHours")), r.openingHours());
+                String cuisine     = firstNonNull(extractGoogleCuisine(g.path("types")), r.cuisine());
+
+                enriched.add(new RestaurantScrapedInfoResponse(
+                        r.name(), description,
+                        priceSymbol != null ? priceSymbol : r.priceRange(),
+                        bounds[0]   != null ? bounds[0]   : r.priceMin(),
+                        bounds[1]   != null ? bounds[1]   : r.priceMax(),
+                        rating, cuisine, hours, phone, website, address,
+                        r.osmId(), r.latitude(), r.longitude(), r.sourceUrl()
+                ));
+            }
+            log.info("Google Places enriqueció {} de {} restaurantes", matchCount, results.size());
+            return enriched;
+
+        } catch (Exception e) {
+            log.error("Google Places enriquecimiento falló: {} — devolviendo sin enriquecer", e.getMessage());
+            return results;
+        }
+    }
+
+    // ── Google helpers ─────────────────────────────────────────────────────
+
+    private boolean handleGoogleStatus(int status, String body) {
+        return switch (status) {
+            case 200 -> true;
+            case 400 -> { log.error("Google Places 400 — request malformado. Body: {}", body); yield false; }
+            case 401, 403 -> {
+                log.error("Google Places {} — API key inválida o sin permisos de Places API (New). " +
+                        "Verifica en https://console.cloud.google.com", status);
+                yield false;
+            }
+            case 429 -> {
+                log.warn("Google Places 429 — cuota diaria agotada. " +
+                        "Revisa https://console.cloud.google.com/apis/dashboard");
+                yield false;
+            }
+            default -> { log.error("Google Places HTTP {} — body: {}", status, body); yield false; }
+        };
+    }
+
+    private String googlePriceToSymbol(String priceLevel) {
+        if (priceLevel == null || priceLevel.isBlank()) return null;
+        return switch (priceLevel) {
+            case "PRICE_LEVEL_INEXPENSIVE"    -> "$";
+            case "PRICE_LEVEL_MODERATE"       -> "$$";
+            case "PRICE_LEVEL_EXPENSIVE"      -> "$$$";
+            case "PRICE_LEVEL_VERY_EXPENSIVE" -> "$$$$";
+            default -> null;
+        };
+    }
+
+    private String extractGoogleHours(JsonNode hours) {
+        if (hours == null || hours.isMissingNode()) return null;
+        JsonNode desc = hours.path("weekdayDescriptions");
+        if (!desc.isArray() || desc.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder();
+        for (JsonNode d : desc) { if (!sb.isEmpty()) sb.append(" | "); sb.append(d.asText()); }
+        return sb.isEmpty() ? null : sb.toString();
+    }
+
+    private String extractGoogleCuisine(JsonNode types) {
+        if (types == null || !types.isArray()) return null;
+        List<String> skip = List.of("point_of_interest", "establishment", "food", "store",
+                "restaurant", "cafe", "bar");
+        for (JsonNode t : types) {
+            String val = t.asText("");
+            if (!skip.contains(val))
+                return val.replace("_restaurant", "").replace("_", " ").trim();
+        }
+        return null;
+    }
+
+    private boolean hasGoogleKey() {
+        return googleApiKey != null && !googleApiKey.isBlank();
+    }
+
+    /** Distancia en metros entre dos coordenadas (fórmula de Haversine). */
+    private double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+        final double R = 6_371_000.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                 + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                 * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    // =========================================================================
+    // FOURSQUARE
+    // =========================================================================
+
     private List<RestaurantScrapedInfoResponse> enrichWithFoursquare(
             List<RestaurantScrapedInfoResponse> results, double lat, double lng, int radiusM) {
         try {
-            // 1. Búsqueda nearby
             String searchUrl = FSQ_SEARCH
                     + "?ll=" + lat + "," + lng
                     + "&radius=" + Math.min(radiusM, 100_000)
@@ -301,12 +565,8 @@ public class RestaurantScrapingClient {
 
             log.debug("Foursquare search: {}", searchUrl);
             HttpResponse<String> searchResp = foursquareGet(searchUrl);
+            if (!handleFoursquareStatus(searchResp.statusCode(), "search")) return results;
 
-            if (!handleFoursquareStatus(searchResp.statusCode(), "search")) {
-                return results;
-            }
-
-            // 2. Construir índice nombre → datos básicos + fsq_place_id (con caché)
             Map<String, FoursquarePlace> index = new LinkedHashMap<>();
             JsonNode places = objectMapper.readTree(searchResp.body()).path("results");
             if (places.isArray()) {
@@ -314,13 +574,10 @@ public class RestaurantScrapingClient {
                     String n = p.path("name").asText(null);
                     if (n == null) continue;
                     String normalized = normalizeName(n);
-
-                    // Usar caché si existe
                     if (fsqCache.containsKey(normalized)) {
                         index.put(normalized, fsqCache.get(normalized));
                         continue;
                     }
-
                     FoursquarePlace place = new FoursquarePlace(
                             p.path("fsq_place_id").asText(null),
                             p.path("price").isMissingNode()  ? null : p.path("price").asInt(),
@@ -329,63 +586,46 @@ public class RestaurantScrapingClient {
                             nullIfEmpty(p.path("website").asText(null)),
                             extractFsqHours(p.path("hours"))
                     );
-
                     fsqCache.put(normalized, place);
                     index.put(normalized, place);
                 }
             }
             log.info("Foursquare indexó {} lugares para enriquecimiento", index.size());
 
-            // 3. Merge: actualizar campos donde haya match por nombre
             List<RestaurantScrapedInfoResponse> enriched = new ArrayList<>();
             for (RestaurantScrapedInfoResponse r : results) {
                 FoursquarePlace fsq = r.name() != null ? index.get(normalizeName(r.name())) : null;
                 if (fsq == null) { enriched.add(r); continue; }
-
                 String priceSymbol = fsq.price() != null ? priceToSymbol(fsq.price()) : r.priceRange();
                 String[] bounds    = normalizeCOP(priceSymbol);
                 String ratingStr   = fsq.rating() != null
-                        ? String.format("%.1f / 10.0", fsq.rating()) : r.rating();
-                String phone       = fsq.tel()     != null ? fsq.tel()     : r.phone();
-                String website     = fsq.website() != null ? fsq.website() : r.website();
-                String hours       = fsq.hours()   != null ? fsq.hours()   : r.openingHours();
-
+                        ? String.format(Locale.US, "%.1f / 10.0", fsq.rating()) : r.rating();
                 enriched.add(new RestaurantScrapedInfoResponse(
                         r.name(), r.description(), priceSymbol, bounds[0], bounds[1],
-                        ratingStr, r.cuisine(), hours, phone, website,
+                        ratingStr, r.cuisine(),
+                        fsq.hours()   != null ? fsq.hours()   : r.openingHours(),
+                        fsq.tel()     != null ? fsq.tel()     : r.phone(),
+                        fsq.website() != null ? fsq.website() : r.website(),
                         r.address(), r.osmId(), r.latitude(), r.longitude(), r.sourceUrl()
                 ));
             }
             return enriched;
-
         } catch (Exception e) {
-            log.error("Foursquare enriquecimiento falló: {} — devolviendo resultados sin enriquecer",
-                    e.getMessage());
+            log.error("Foursquare enriquecimiento falló: {} — devolviendo sin enriquecer", e.getMessage());
             return results;
         }
     }
 
-    /**
-     * Obtiene detalles completos de un lugar por su fsq_place_id.
-     * Endpoint: GET /places/{fsq_place_id}
-     * Retorna: price, rating, tel, website, hours.display, photos, tastes, etc.
-     */
     public FoursquareDetails getFoursquareDetails(String fsqPlaceId) throws Exception {
         String url = FSQ_DETAILS + fsqPlaceId
                 + "?fields=fsq_place_id,name,price,rating,tel,website,hours,location,"
                 + "photos,tastes,description,attributes";
-
         log.debug("Foursquare details: {}", url);
         HttpResponse<String> resp = foursquareGet(url);
-
-        if (!handleFoursquareStatus(resp.statusCode(), "details/" + fsqPlaceId)) {
-            return null;
-        }
-
+        if (!handleFoursquareStatus(resp.statusCode(), "details/" + fsqPlaceId)) return null;
         JsonNode p = objectMapper.readTree(resp.body());
         return new FoursquareDetails(
-                p.path("fsq_place_id").asText(null),
-                p.path("name").asText(null),
+                p.path("fsq_place_id").asText(null), p.path("name").asText(null),
                 p.path("price").isMissingNode()  ? null : p.path("price").asInt(),
                 p.path("rating").isMissingNode() ? null : p.path("rating").asDouble(),
                 nullIfEmpty(p.path("tel").asText(null)),
@@ -398,66 +638,36 @@ public class RestaurantScrapingClient {
         );
     }
 
-    // ── Foursquare HTTP helper ─────────────────────────────────────────────
-
     private HttpResponse<String> foursquareGet(String url) throws IOException, InterruptedException {
         HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(timeoutMs))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
-
+                .followRedirects(HttpClient.Redirect.NORMAL).build();
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .header("Authorization",      "Bearer " + foursquareApiKey)
+                .header("Authorization",        "Bearer " + foursquareApiKey)
                 .header("X-Places-Api-Version", FSQ_API_VERSION)
-                .header("Accept",              "application/json")
-                .header("User-Agent",          userAgent)
+                .header("Accept",               "application/json")
+                .header("User-Agent",           userAgent)
                 .timeout(Duration.ofMillis(timeoutMs + 5000L))
                 .GET().build();
-
         return client.send(req, HttpResponse.BodyHandlers.ofString());
     }
 
-    /**
-     * Maneja los códigos de error de Foursquare con mensajes de diagnóstico claros.
-     * @return true si el request fue exitoso (HTTP 200)
-     */
     private boolean handleFoursquareStatus(int status, String endpoint) {
         return switch (status) {
             case 200 -> true;
-            case 401 -> {
-                log.error("Foursquare 401 en '{}' — API key inválida o sin prefijo Bearer", endpoint);
-                yield false;
-            }
-            case 403 -> {
-                log.error("Foursquare 403 en '{}' — key sin permisos de Places API", endpoint);
-                yield false;
-            }
-            case 404 -> {
-                log.warn("Foursquare 404 en '{}' — recurso no encontrado", endpoint);
-                yield false;
-            }
-            case 410 -> {
-                log.error("""
-                        Foursquare 410 en '{}' — endpoint deprecado.
-                        Usa el dominio nuevo: places-api.foursquare.com
-                        Header requerido: X-Places-Api-Version: {}
-                        """, endpoint, FSQ_API_VERSION);
-                yield false;
-            }
+            case 401 -> { log.error("Foursquare 401 en '{}' — API key inválida", endpoint); yield false; }
+            case 403 -> { log.error("Foursquare 403 en '{}' — sin permisos", endpoint); yield false; }
+            case 404 -> { log.warn("Foursquare 404 en '{}' — no encontrado", endpoint); yield false; }
+            case 410 -> { log.error("Foursquare 410 en '{}' — endpoint deprecado", endpoint); yield false; }
             case 429 -> {
                 log.warn("Foursquare 429 en '{}' — rate limit alcanzado. " +
                         "Espera 1 hora o verifica tu plan en https://developer.foursquare.com", endpoint);
                 yield false;
             }
-            default -> {
-                log.error("Foursquare HTTP {} en '{}'", status, endpoint);
-                yield false;
-            }
+            default -> { log.error("Foursquare HTTP {} en '{}'", status, endpoint); yield false; }
         };
     }
-
-    // ── Foursquare field extractors ────────────────────────────────────────
 
     private String extractFsqHours(JsonNode hours) {
         if (hours == null || hours.isMissingNode()) return null;
@@ -465,8 +675,8 @@ public class RestaurantScrapingClient {
     }
 
     private List<String> extractFsqPhotos(JsonNode photos) {
-        List<String> urls = new ArrayList<>();
         if (photos == null || !photos.isArray()) return null;
+        List<String> urls = new ArrayList<>();
         int count = 0;
         for (JsonNode ph : photos) {
             if (count++ >= 3) break;
@@ -492,9 +702,8 @@ public class RestaurantScrapingClient {
         addAttr(map, attrs, "delivery",        "delivery");
         addAttr(map, attrs, "has_parking",     "has_parking");
         addAttr(map, attrs, "atm",             "atm");
-        if (attrs.has("wifi") && !attrs.path("wifi").isMissingNode()) {
+        if (attrs.has("wifi") && !attrs.path("wifi").isMissingNode())
             map.put("wifi", !"no".equalsIgnoreCase(attrs.path("wifi").asText("")));
-        }
         return map.isEmpty() ? null : map;
     }
 
@@ -511,17 +720,14 @@ public class RestaurantScrapingClient {
         HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(timeoutMs))
                 .followRedirects(HttpClient.Redirect.NORMAL).build();
-
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .timeout(Duration.ofMillis(timeoutMs + 15000L))
                 .GET();
         headers.forEach(builder::header);
-
         HttpResponse<String> resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         log.debug("GET {} → HTTP {}",
                 url.length() > 120 ? url.substring(0, 120) + "..." : url, resp.statusCode());
-
         if (resp.statusCode() != 200)
             throw new IOException("HTTP " + resp.statusCode() + " for: " + url);
         return resp.body();
@@ -635,7 +841,7 @@ public class RestaurantScrapingClient {
     // =========================================================================
 
     private record FoursquarePlace(
-            String fsqPlaceId,
+            String  fsqPlaceId,
             Integer price,
             Double  rating,
             String  tel,
@@ -643,22 +849,17 @@ public class RestaurantScrapingClient {
             String  hours
     ) {}
 
-    /**
-     * Datos completos de un lugar de Foursquare (endpoint /places/{id}).
-     * Expuesto como public para uso desde ScrapingService si se necesita
-     * detalle de un restaurante individual.
-     */
     public record FoursquareDetails(
-            String              fsqPlaceId,
-            String              name,
-            Integer             price,
-            Double              rating,
-            String              tel,
-            String              website,
-            String              hours,
-            String              description,
-            List<String>        photos,
-            List<String>        tastes,
+            String               fsqPlaceId,
+            String               name,
+            Integer              price,
+            Double               rating,
+            String               tel,
+            String               website,
+            String               hours,
+            String               description,
+            List<String>         photos,
+            List<String>         tastes,
             Map<String, Boolean> attributes
     ) {}
 }
