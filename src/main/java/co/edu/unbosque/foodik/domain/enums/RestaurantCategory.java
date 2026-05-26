@@ -1,0 +1,2 @@
+package co.edu.unbosque.foodik.domain.enums;
+public enum RestaurantCategory { ITALIAN, MEXICAN, JAPANESE, CHINESE, AMERICAN, COLOMBIAN, MEDITERRANEAN, INDIAN, FRENCH, VEGAN, SEAFOOD, FAST_FOOD, STEAKHOUSE, BAKERY, CAFE, OTHER }
